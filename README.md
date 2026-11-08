@@ -16,8 +16,9 @@ Collect Windows and Azure logs in Microsoft Sentinel, simulate attacks with Atom
 ## Cost guardrails
 
 - **Azure for Students subscription, no credit card attached.** Spending stops at the credit limit instead of billing a card.
-- **Sentinel free trial.** After Sentinel is enabled on a workspace, the first 10 GB/day is free for 31 days, covering both Log Analytics ingestion and Sentinel charges. The lab is planned to finish inside that window.
-- **One resource group** (`rg-sentinel-lab`) holds every lab resource.
+- **Sentinel free trial.** After Sentinel is enabled on a workspace, the first 10 GB/day is free for 31 days, covering both Log Analytics ingestion and Sentinel charges. The lab is planned to finish, and be torn down, inside that window.
+- **Daily cap of 1 GB/day** on the workspace (resets 02:00 UTC). Outside the trial, Analytics Logs ingestion is listed at $2.76/GB in this region, plus Sentinel charges, so the cap limits the worst-case daily cost. The trade-off: once the cap is hit, logs stop until the reset, which would be a blind spot in a production SOC. [Screenshot](screenshots/cost-guardrails.png)
+- **One resource group** (`rg-sentinel-lab`) holds every lab resource, in Canada Central (one of the subscription's allowed regions).
 - **VM shut down (deallocated) after every session**, so compute isn't billed while idle.
 - **Credit checked weekly.**
 
@@ -28,7 +29,8 @@ Delete `rg-sentinel-lab`. Every lab resource goes with it.
 ## Progress
 
 - [x] Azure for Students subscription
-- [ ] Resource group, Log Analytics workspace, Sentinel enabled
+- [x] Resource group and Log Analytics workspace, with a 1 GB/day cap
+- [ ] Microsoft Sentinel enabled, Azure Activity logs connected
 - [ ] Windows VM with Sysmon and Azure Monitor Agent
 - [ ] Logs arriving in Sentinel
 - [ ] Rule 1: renamed system binaries (T1036.003)
