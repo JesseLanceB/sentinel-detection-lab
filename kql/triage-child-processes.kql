@@ -1,0 +1,9 @@
+// Triage query for Rule 1 alerts: what did the suspicious process start?
+// Replace the path with the Image value from the alert.
+WindowsEvent
+| where EventID == 1
+| where tostring(EventData.ParentImage) =~ @"C:\Windows\Temp\lsass.exe"
+| project TimeGenerated,
+    Child = tostring(EventData.Image),
+    CommandLine = tostring(EventData.CommandLine),
+    User = tostring(EventData.User)

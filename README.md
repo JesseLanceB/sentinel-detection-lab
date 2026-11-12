@@ -27,6 +27,20 @@ Collect Windows and Azure logs in Microsoft Sentinel, simulate attacks with Atom
 
 Delete `rg-sentinel-lab`. Every lab resource goes with it.
 
+## Detections
+
+| Rule | MITRE ATT&CK | Data source | Status |
+|---|---|---|---|
+| [Renamed system binary executed](kql/rule1-renamed-binaries.kql) | T1036.003, Masquerading: Rename System Utilities | Sysmon Event 1 (`WindowsEvent`) | Live, tested |
+
+**Rule 1 logic.** Alerts when either condition is true:
+- **A:** a commonly abused Windows tool (`cmd`, `powershell`, `rundll32`, `mshta`, `wscript`, `cscript`, `certutil`) runs under a different file name than the one built into the binary (Sysmon `OriginalFileName`).
+- **B:** a file named `lsass.exe` runs from anywhere other than `C:\Windows\System32`.
+
+Names are normalized before comparing, because legitimate Windows binaries differ in three ways: `Image` is a full path while `OriginalFileName` is a bare name, case varies (`notepad.exe` vs `NOTEPAD.EXE`), and some names omit `.exe` (`UsoClient.exe` vs `UsoClient`). Without normalizing, all three would cause false positives.
+
+**Schedule:** runs every 5 minutes, looks back 30 minutes, with an ingestion-time filter (see the November 11 notes). Triage helper: [child processes of the flagged process](kql/triage-child-processes.kql).
+
 ## Progress
 
 - [x] Azure for Students subscription
@@ -34,7 +48,7 @@ Delete `rg-sentinel-lab`. Every lab resource goes with it.
 - [x] Microsoft Sentinel enabled, Azure Activity logs connected
 - [x] Windows VM with Sysmon and Azure Monitor Agent
 - [x] Sysmon logs arriving in Sentinel
-- [ ] Rule 1: renamed system binaries (T1036.003)
+- [x] Rule 1: renamed system binaries (T1036.003)
 - [ ] Rule 2: Microsoft Defender exclusion added (T1562.001)
 - [ ] Stretch rule: cloud logging disabled, such as a deleted diagnostic setting (T1562.008)
 - [ ] Writeup and lessons learned
@@ -52,3 +66,11 @@ Delete `rg-sentinel-lab`. Every lab resource goes with it.
 - **The OS blocked the downloaded `.rdp` file.** Smart App Control flagged it, a reasonable defense because malicious `.rdp` attachments have been used in phishing campaigns. I connected by entering the VM's IP in Remote Desktop Connection instead of turning the protection off.
 - **Sysmon fields are nested.** Events land in `WindowsEvent`, with Sysmon's fields (`Image`, `OriginalFileName`, `ParentImage`, `CommandLine`, `Hashes`) inside the dynamic `EventData` column. KQL reads them with `tostring(EventData.OriginalFileName)`.
 - **The tuning case reproduced on a new machine.** As in my [masquerading lab](https://github.com/JesseLanceB/sysmon-masquerading-detection), the legitimate `unsecapp.exe` reports OriginalFileName `unsecapp.dll`, and `Sysmon64.exe` reports none. Both are normal Windows behaviour, which confirms why Rule 1 can't alert on every name mismatch. The Sysmon config hash also matched the earlier lab exactly: identical hash, identical file.
+
+**November 11: Rule 1 built, tested and live.**
+
+- **Baseline first.** Before simulating anything, the rule's query returned 0 results across 7 days of normal activity, while the same window held real process events, including the benign mismatches above. So it ignores legitimate activity. [Baseline](screenshots/rule1-baseline-7days.png) · [Data present](screenshots/rule1-data-present.png)
+- **True positive.** I copied `cmd.exe` to `C:\Windows\Temp\lsass.exe` and ran `whoami` through it. The query returned exactly one row, with four red flags: OriginalFileName `Cmd.Exe`, location `Temp` instead of System32, a `/c whoami` command line, and `powershell.exe` as the parent (the real lsass is started by `wininit.exe`). [Screenshot](screenshots/rule1-true-positive.png)
+- **The first live test missed, because of ingestion delay.** Logs reached the workspace an average of 9 minutes and up to 17 minutes after the event, but the rule only looked back 10 minutes. Events arrived after the window that should have checked them had already closed. I fixed it by extending the lookback to 30 minutes and adding `ingestion_time() > ago(6m)`, so each event is evaluated once, when it arrives. [Delay measurement](screenshots/ingestion-delay.png)
+- **After the fix, an incident in 10 minutes.** The retest at 7:56 PM produced an incident at 8:06 PM, with the host and process entities mapped and the MITRE tactic and technique attached. I classified it as a benign positive: the rule worked correctly, and the activity was an authorized test. [Rule](screenshots/rule1-analytics-rule.png) · [Incident](screenshots/rule1-incident.png) · [Incident details](screenshots/rule1-incident-details.png)
+- **Smaller lessons.** MITRE IDs starting with T08 belong to the ICS (industrial control systems) matrix, so the rule is mapped to Enterprise T1036.003. One test ran from 32-bit PowerShell, so Windows redirected the copy to the 32-bit `cmd.exe` in `SysWOW64`, and its child `whoami.exe` also ran from `SysWOW64`. Unusual paths often have a mundane explanation.
