@@ -1,0 +1,20 @@
+// Rule 2: Microsoft Defender exclusion added (MITRE ATT&CK T1562.001)
+// Data source: Defender Operational log, Event ID 5007 (configuration changed),
+// collected through the data collection rule in the WindowsEvent table.
+// Why 5007 and not Sysmon: in testing, 5007 recorded exclusions added both from an
+// open PowerShell session and from a new powershell.exe process. Sysmon Event 1 only
+// saw the second, and this Sysmon config doesn't watch the exclusions registry key.
+// Rule type: near-real-time (NRT). Sentinel runs it every minute on newly arrived
+// events. It replaced a scheduled version that fired twice for one late-arriving event.
+WindowsEvent
+| where Channel == "Microsoft-Windows-Windows Defender/Operational"
+| where EventID == 5007
+| extend NewValue = tostring(EventData["New Value"]),
+    OldValue = tostring(EventData["Old Value"])
+// 5007 fires for many config changes (service startup, config hash, UX settings).
+// Keep only additions under the Exclusions key: Paths, Extensions, Processes and so on.
+// Removals leave New Value empty, so they don't match.
+| where NewValue contains @"\Exclusions\"
+| extend ExclusionType = extract(@"\\Exclusions\\([^\\]+)\\", 1, NewValue),
+    ExcludedItem = extract(@"\\Exclusions\\[^\\]+\\(.+?) = ", 1, NewValue)
+| project TimeGenerated, Computer, ExclusionType, ExcludedItem, NewValue

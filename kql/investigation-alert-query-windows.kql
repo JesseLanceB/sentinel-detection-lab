@@ -1,0 +1,20 @@
+// Investigation: which scheduled rule run produced each alert?
+// Rebuilds each run's query window from the SecurityAlert table. Used to trace why
+// one event produced two alerts (see the November 16 lab notes).
+// Change the AlertName filter to the rule you're investigating.
+SecurityAlert
+| where TimeGenerated > ago(7d)
+| where AlertName has "Defender exclusion"
+| extend Props = parse_json(ExtendedProperties)
+| project AlertCreated = TimeGenerated,
+    EventTime = StartTime,
+    QueryStart = tostring(Props["Query Start Time UTC"]),
+    QueryEnd = tostring(Props["Query End Time UTC"])
+| sort by AlertCreated asc
+
+// Companion check: when did each event actually arrive in the workspace?
+// WindowsEvent
+// | where TimeGenerated > ago(7d)
+// | where EventID == 5007
+// | project TimeGenerated, Arrived = ingestion_time(),
+//     DelaySeconds = datetime_diff("second", ingestion_time(), TimeGenerated)

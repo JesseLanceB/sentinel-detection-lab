@@ -4,12 +4,12 @@ Building and testing detections in Microsoft Sentinel, mapped to MITRE ATT&CK. F
 
 ## Goal
 
-Collect Windows and Azure logs in Microsoft Sentinel, simulate attacks with Atomic Red Team, and write KQL analytics rules that catch them. The first rule ports my Sysmon detection for renamed system binaries (T1036.003) into a cloud SIEM.
+Collect Windows and Azure logs in Microsoft Sentinel, simulate attacker techniques with harmless tests, and write KQL analytics rules that catch them. The first rule ports my Sysmon detection for renamed system binaries (T1036.003) into a cloud SIEM. The second catches an attacker switching off antivirus scanning for their files (T1562.001).
 
 ## Architecture
 
 - **Endpoint:** Windows Server 2022 VM (`Standard_B2ls_v2`) in Sweden Central, running Sysmon with a widely used community configuration
-- **Collection:** the Azure Monitor Agent, with a data collection rule created through the Windows Forwarded Events connector (XPath `Microsoft-Windows-Sysmon/Operational!*`), sends Sysmon events to the `WindowsEvent` table
+- **Collection:** the Azure Monitor Agent, with a data collection rule created through the Windows Forwarded Events connector, sends events to the `WindowsEvent` table. Two XPath queries: `Microsoft-Windows-Sysmon/Operational!*` (all Sysmon events) and `Microsoft-Windows-Windows Defender/Operational!*[System[(EventID=5007)]]` (Defender configuration changes only)
 - **SIEM:** Microsoft Sentinel on a Log Analytics workspace in Canada Central
 - **Cloud audit:** Azure Activity logs (free) through a subscription diagnostic setting, for control-plane detections
 
@@ -29,9 +29,12 @@ Delete `rg-sentinel-lab`. Every lab resource goes with it.
 
 ## Detections
 
-| Rule | MITRE ATT&CK | Data source | Status |
-|---|---|---|---|
-| [Renamed system binary executed](kql/rule1-renamed-binaries.kql) | T1036.003, Masquerading: Rename System Utilities | Sysmon Event 1 (`WindowsEvent`) | Live, tested |
+| Rule | MITRE ATT&CK | Data source | Rule type | Status |
+|---|---|---|---|---|
+| [Renamed system binary executed](kql/rule1-renamed-binaries.kql) | T1036.003, Masquerading: Rename System Utilities | Sysmon Event 1 | Near-real-time (NRT) | Live, tested |
+| [Defender exclusion added](kql/rule2-defender-exclusion-added.kql) | T1562.001, Impair Defenses: Disable or Modify Tools | Defender Operational Event 5007 | Near-real-time (NRT) | Live, tested |
+
+Both are NRT rules, which Sentinel runs every minute on newly arrived events. They started as scheduled rules and were moved to NRT after an investigation into duplicate alerts (November 16 notes).
 
 **Rule 1 logic.** Alerts when either condition is true:
 - **A:** a commonly abused Windows tool (`cmd`, `powershell`, `rundll32`, `mshta`, `wscript`, `cscript`, `certutil`) runs under a different file name than the one built into the binary (Sysmon `OriginalFileName`).
@@ -39,7 +42,13 @@ Delete `rg-sentinel-lab`. Every lab resource goes with it.
 
 Names are normalized before comparing, because legitimate Windows binaries differ in three ways: `Image` is a full path while `OriginalFileName` is a bare name, case varies (`notepad.exe` vs `NOTEPAD.EXE`), and some names omit `.exe` (`UsoClient.exe` vs `UsoClient`). Without normalizing, all three would cause false positives.
 
-**Schedule:** runs every 5 minutes, looks back 30 minutes, with an ingestion-time filter (see the November 11 notes). Triage helper: [child processes of the flagged process](kql/triage-child-processes.kql).
+Triage helper: [child processes of the flagged process](kql/triage-child-processes.kql).
+
+**Rule 2 logic.** Alerts when Defender's Event 5007 (configuration changed) shows a new value under the `Exclusions` registry key: a folder, file type or process that Defender will no longer scan. Attackers add exclusions so their tools aren't detected. The query extracts the exclusion type and the excluded item, so the alert shows *what* was excluded without opening the raw event. Removals and the many routine 5007 events (service start, configuration hash, notification settings) don't match.
+
+**Why Defender's log and not Sysmon:** in testing, Sysmon only saw exclusions added by starting a new PowerShell process. Defender's own log caught every addition (November 15 notes).
+
+**Investigation helper:** [rebuild each rule run's query window from SecurityAlert](kql/investigation-alert-query-windows.kql).
 
 ## Progress
 
@@ -49,7 +58,8 @@ Names are normalized before comparing, because legitimate Windows binaries diffe
 - [x] Windows VM with Sysmon and Azure Monitor Agent
 - [x] Sysmon logs arriving in Sentinel
 - [x] Rule 1: renamed system binaries (T1036.003)
-- [ ] Rule 2: Microsoft Defender exclusion added (T1562.001)
+- [x] Rule 2: Microsoft Defender exclusion added (T1562.001)
+- [x] Duplicate alerts investigated; both rules moved to near-real-time (NRT)
 - [ ] Stretch rule: cloud logging disabled, such as a deleted diagnostic setting (T1562.008)
 - [ ] Writeup and lessons learned
 
@@ -71,6 +81,43 @@ Names are normalized before comparing, because legitimate Windows binaries diffe
 
 - **Baseline first.** Before simulating anything, the rule's query returned 0 results across 7 days of normal activity, while the same window held real process events, including the benign mismatches above. So it ignores legitimate activity. [Baseline](screenshots/rule1-baseline-7days.png) · [Data present](screenshots/rule1-data-present.png)
 - **True positive.** I copied `cmd.exe` to `C:\Windows\Temp\lsass.exe` and ran `whoami` through it. The query returned exactly one row, with four red flags: OriginalFileName `Cmd.Exe`, location `Temp` instead of System32, a `/c whoami` command line, and `powershell.exe` as the parent (the real lsass is started by `wininit.exe`). [Screenshot](screenshots/rule1-true-positive.png)
-- **The first live test missed, because of ingestion delay.** Logs reached the workspace an average of 9 minutes and up to 17 minutes after the event, but the rule only looked back 10 minutes. Events arrived after the window that should have checked them had already closed. I fixed it by extending the lookback to 30 minutes and adding `ingestion_time() > ago(6m)`, so each event is evaluated once, when it arrives. [Delay measurement](screenshots/ingestion-delay.png)
+- **What I thought was a miss.** After the first live test (7:30 PM), no incident had appeared when I checked. I measured log delay: events reached the workspace an average of 9 minutes and up to 17 minutes after they happened, while the rule only looked back 10 minutes. So I extended the lookback to 30 minutes and added `ingestion_time() > ago(6m)`, meant to evaluate each event once, when it arrives. [Delay measurement](screenshots/ingestion-delay.png)
+- **Correction (November 16).** The first test didn't miss. The SecurityAlert table shows the original rule alerted on it twice, at 7:38 and 7:43 PM. The event arrived in 44 seconds, and I had checked before the alerts existed. The duplicate came from the original settings: a 10-minute lookback on a 5-minute schedule makes each window overlap the previous one, so the event sat in two windows. The delay risk I measured was real, but it wasn't what happened in that test. [Three alerts for two tests](screenshots/rule1-three-alerts.png) · [Arrival times](screenshots/test-event-arrival-times.png)
 - **After the fix, an incident in 10 minutes.** The retest at 7:56 PM produced an incident at 8:06 PM, with the host and process entities mapped and the MITRE tactic and technique attached. I classified it as a benign positive: the rule worked correctly, and the activity was an authorized test. [Rule](screenshots/rule1-analytics-rule.png) · [Incident](screenshots/rule1-incident.png) · [Incident details](screenshots/rule1-incident-details.png)
 - **Smaller lessons.** MITRE IDs starting with T08 belong to the ICS (industrial control systems) matrix, so the rule is mapped to Enterprise T1036.003. One test ran from 32-bit PowerShell, so Windows redirected the copy to the 32-bit `cmd.exe` in `SysWOW64`, and its child `whoami.exe` also ran from `SysWOW64`. Unusual paths often have a mundane explanation.
+
+**November 15: Rule 2 telemetry check.** Before writing the rule, I checked which logs record a Defender exclusion. I added two test exclusions in two different ways:
+
+- **Test A**, typed in an open PowerShell session: `Add-MpPreference -ExclusionPath "C:\LabTestA"`
+- **Test B**, launched as a new process: `powershell.exe -NoProfile -Command "Add-MpPreference -ExclusionPath 'C:\LabTestB'"`
+
+| Log | Test A (open session) | Test B (new process) |
+|---|---|---|
+| Defender Event 5007 | Recorded | Recorded |
+| Sysmon Event 1 (process creation) | Not recorded | Recorded |
+
+- **Sysmon only saw Test B,** because Test A didn't start a new process. An attacker typing commands in an existing shell leaves no process-creation event. [Sysmon result](screenshots/rule2-sysmon-sees-test-b-only.png)
+- **The two logs agreed on Test B.** Sysmon recorded the PowerShell process at 3:07:19 UTC and Defender recorded the exclusion at 3:07:21, two seconds apart. Matching events across logs by time like this is how one log confirms another.
+- **Event 5007 is noisy.** Of 16 events in the test window, 12 were routine configuration changes, such as the service starting or the configuration hash updating. Filtering on the `\Exclusions\` registry path kept only the additions. [All 5007 events](screenshots/rule2-5007-all-events.png)
+- **The Sysmon configuration has a gap.** The community configuration watches the Group Policy exclusions key (`HKLM\SOFTWARE\Policies\Microsoft\Windows Defender\Exclusions`), but not the key that `Add-MpPreference` writes to, so its registry monitoring doesn't cover these changes. Defender's own log was the reliable source.
+- **Not covered yet:** Event 5007 records the change, not the command behind it. PowerShell Script Block Logging (Event 4104) would record commands typed inside a session, such as Test A.
+
+**November 16: Rule 2 built, and a duplicate-alert investigation.**
+
+- **Query test.** Over the test window, the query returned exactly the two test exclusions and none of the noise. [Screenshot](screenshots/rule2-query-test.png)
+- **Scheduled rule.** Medium severity, Defense Evasion T1562.001, Host entity mapped, every 5 minutes with a 30-minute lookback and the same `ingestion_time() > ago(6m)` filter as Rule 1. [Rule](screenshots/rule2-scheduled-rule.png)
+- **Live test: one event, two incidents.** I added `C:\LabTestC` at 8:21 PM. The rule fired, but incidents 12865 and 12866 both pointed at the same single event. [Incidents](screenshots/rule2-duplicate-incidents.png)
+- **Tracing it.** The event arrived 8 minutes 23 seconds after it happened. [Arrival](screenshots/rule2-labtestc-arrival.png) SecurityAlert showed two alerts with the same event time. [Alerts](screenshots/rule2-two-alerts.png) The alerts' `ExtendedProperties` field records each run's query window: the two windows ended at 1:29:35 and 1:34:35 UTC, and each alert was created about 5 minutes after its window ended. This matches Microsoft's documented five-minute delay for scheduled rules. [Query windows](screenshots/rule2-alert-query-windows.png)
+- **Rule 1 had it too.** The same check on Rule 1 found three alerts for two tests: the 7:30 PM duplicate from the original settings (see the November 11 correction), and one alert for the 7:56 PM retest. Then I pulled the arrival time of every test event: 40 to 53 seconds for the Rule 1 tests, 8 minutes 23 seconds for LabTestC.
+- **Two explanations, one ruled out.** The rule only keeps events that arrived in the last 6 minutes, and the question was when Sentinel starts counting those 6 minutes back.
+  - **From when the query actually runs:** then the 7:56 PM test would have produced no alert at all. It did alert, so this is ruled out.
+  - **From the end of the query window:** then each run accepts events that arrived over an 11-minute range (6 minutes before the window ended, through the run 5 minutes later), while runs are only 5 minutes apart. A slow arrival lands in two runs' ranges, so LabTestC alerted twice. A fast arrival usually lands in one, so the 7:56 PM test alerted once. This fits both test events that ran under the filter. Microsoft doesn't document this behaviour, so it's my inference from the data.
+- **The fix: near-real-time (NRT) rules.** NRT rules run every minute and evaluate events by arrival time, which is Microsoft's designed answer to late logs. The query needs no timing workaround. Under my inferred model, a scheduled rule could also be fixed by capping the filter (`ingestion_time() <= now()`), but that depends on undocumented behaviour, so I chose the documented design.
+- **NRT verified on Rule 2.** I added `C:\LabTestD` at 11:05 PM. It arrived 36 seconds later, and the NRT rule raised one alert 2 minutes 22 seconds after arrival, still one alert when rechecked 12 minutes later. From event to alert took about 3 minutes, compared with 13 minutes and two alerts under the scheduled rule. This event arrived quickly, but the duplicate had come from a slow arrival, so the next test needed a slow one (November 17). [Arrival](screenshots/rule2-nrt-event-arrival.png) · [One alert](screenshots/rule2-nrt-one-alert.png)
+
+**November 17: Rule 1 moved to NRT and tested with a slow arrival.**
+
+- I disabled the scheduled Rule 1 and recreated it as an NRT rule: the same query without the `ingestion_time()` filter, the same MITRE mapping and entities. [Rule](screenshots/rule1-nrt-rule.png)
+- The test event happened at 9:58 PM and took 8 minutes 29 seconds to arrive, about as slow as LabTestC, the event that alerted twice under the scheduled rule. [Arrival](screenshots/rule1-nrt-event-arrival.png)
+- The NRT rule raised one alert 2 minutes 52 seconds after arrival, and it was still the only alert 7 minutes later. [One alert](screenshots/rule1-nrt-one-alert.png)
+- Across both rules, NRT has now produced exactly one alert per event for a fast arrival (36 seconds) and a slow one (8 and a half minutes).
