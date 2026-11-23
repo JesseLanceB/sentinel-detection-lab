@@ -4,7 +4,7 @@ Building and testing detections in Microsoft Sentinel, mapped to MITRE ATT&CK. F
 
 ## Goal
 
-Collect Windows and Azure logs in Microsoft Sentinel, simulate attacker techniques with harmless tests, and write KQL analytics rules that catch them. The first rule ports my Sysmon detection for renamed system binaries (T1036.003) into a cloud SIEM. The second catches an attacker switching off antivirus scanning for their files (T1562.001).
+Collect Windows and Azure logs in Microsoft Sentinel, simulate attacker techniques with harmless tests, and write KQL analytics rules that catch them. The first rule ports my Sysmon detection for renamed system binaries (T1036.003) into a cloud SIEM. The second catches an attacker switching off antivirus scanning for their files (T1562.001), and the third catches someone cutting the pipes that send Azure logs to the SIEM (T1562.008).
 
 ## Architecture
 
@@ -33,8 +33,9 @@ Delete `rg-sentinel-lab`. Every lab resource goes with it.
 |---|---|---|---|---|
 | [Renamed system binary executed](kql/rule1-renamed-binaries.kql) | T1036.003, Masquerading: Rename System Utilities | Sysmon Event 1 | Near-real-time (NRT) | Live, tested |
 | [Defender exclusion added](kql/rule2-defender-exclusion-added.kql) | T1562.001, Impair Defenses: Disable or Modify Tools | Defender Operational Event 5007 | Near-real-time (NRT) | Live, tested |
+| [Diagnostic setting deleted](kql/rule3-diagnostic-setting-deleted.kql) | T1562.008, Impair Defenses: Disable or Modify Cloud Logs | Azure Activity log (`AzureActivity`) | Near-real-time (NRT) | Live, tested |
 
-Both are NRT rules, which Sentinel runs every minute on newly arrived events. They started as scheduled rules and were moved to NRT after an investigation into duplicate alerts (November 16 notes).
+All three are NRT rules, which Sentinel runs every minute on newly arrived events. Rules 1 and 2 started as scheduled rules and were moved to NRT after an investigation into duplicate alerts (November 16 notes). Rule 3 was built as NRT from the start.
 
 **Rule 1 logic.** Alerts when either condition is true:
 - **A:** a commonly abused Windows tool (`cmd`, `powershell`, `rundll32`, `mshta`, `wscript`, `cscript`, `certutil`) runs under a different file name than the one built into the binary (Sysmon `OriginalFileName`).
@@ -50,6 +51,10 @@ Triage helper: [child processes of the flagged process](kql/triage-child-process
 
 **Investigation helper:** [rebuild each rule run's query window from SecurityAlert](kql/investigation-alert-query-windows.kql).
 
+**Rule 3 logic.** Alerts when an Azure diagnostic setting is deleted (`MICROSOFT.INSIGHTS/DIAGNOSTICSETTINGS/DELETE`), or when someone tries and fails. Diagnostic settings are the pipes that send Azure logs to the SIEM, so deleting one blinds the SOC before the attacker's main action. Each action logs a `Start` row and an outcome row, so the query keeps only `Success` and `Failure`; otherwise one delete would raise two alerts. A failed attempt is kept on purpose, because it can mean someone testing what a stolen account is allowed to do. The alert names the deleted setting, taken from the end of `_ResourceId`, and maps the caller's account, their IP address and the Azure resource as entities.
+
+**Not covered yet:** an attacker could also *edit* a setting, unticking its log categories or pointing it at another workspace. That logs as `DIAGNOSTICSETTINGS/WRITE`, exactly like every legitimate creation, so alerting on every WRITE would be noisy. A better rule would flag a WRITE by someone who hasn't changed diagnostic settings in the last 30 days. That needs history, so it would be a scheduled rule, not NRT.
+
 ## Progress
 
 - [x] Azure for Students subscription
@@ -60,7 +65,7 @@ Triage helper: [child processes of the flagged process](kql/triage-child-process
 - [x] Rule 1: renamed system binaries (T1036.003)
 - [x] Rule 2: Microsoft Defender exclusion added (T1562.001)
 - [x] Duplicate alerts investigated; both rules moved to near-real-time (NRT)
-- [ ] Stretch rule: cloud logging disabled, such as a deleted diagnostic setting (T1562.008)
+- [x] Rule 3: diagnostic setting deleted (T1562.008)
 - [ ] Writeup and lessons learned
 
 ## Lab notes
@@ -121,3 +126,13 @@ Triage helper: [child processes of the flagged process](kql/triage-child-process
 - The test event happened at 9:58 PM and took 8 minutes 29 seconds to arrive, about as slow as LabTestC, the event that alerted twice under the scheduled rule. [Arrival](screenshots/rule1-nrt-event-arrival.png)
 - The NRT rule raised one alert 2 minutes 52 seconds after arrival, and it was still the only alert 7 minutes later. [One alert](screenshots/rule1-nrt-one-alert.png)
 - Across both rules, NRT has now produced exactly one alert per event for a fast arrival (36 seconds) and a slow one (8 and a half minutes).
+
+**November 22: Rule 3, cloud logging deleted (T1562.008).** Built as an NRT rule from the start, because one event is enough to alert.
+
+- **Telemetry first, on a throwaway.** I created and deleted a test diagnostic setting (`diag-test-delete`) on the workspace, not the real `activity-to-sentinel` setting. That one is the pipe that delivers `AzureActivity` itself, so deleting it might stop its own delete event from arriving. It gets a separate test.
+- **Four rows for two actions.** The create logged as `DIAGNOSTICSETTINGS/WRITE` and the delete as `DIAGNOSTICSETTINGS/DELETE`, each with a `Start` and a `Success` row, as in the November 8 tag test. [Screenshot](screenshots/rule3-telemetry-arrival.png)
+- **Logs don't arrive in order.** The delete happened 2.5 minutes after the create but arrived first, after 4.5 minutes of delay against 8.5. A rule about a sequence of actions has to order events by `TimeGenerated`, never by arrival.
+- **Query test.** One row: `Success`, setting `diag-test-delete`. [Screenshot](screenshots/rule3-query-test.png) My first run returned nothing, because by then the event was older than the query's `ago(2h)` filter. `ago()` always counts back from the moment the query runs.
+- **Rule.** High severity: legitimate deletions are rare and should go through change management, and cutting logs usually comes right before an attacker's main action. Account, IP and Azure resource entities mapped. [Rule](screenshots/rule3-nrt-rule.png)
+- **Live test.** I created and deleted `diag-test-delete2`. The delete happened at 8:08:25 PM and arrived 3 minutes 43 seconds later. The NRT rule raised one alert 2 minutes 16 seconds after arrival, about 6 minutes after the delete. The create raised nothing. [Arrival](screenshots/rule3-nrt-event-arrival.png) · [Alert](screenshots/rule3-nrt-one-alert.png)
+- **Time to alert = log delay + rule delay.** Across all three rules, NRT added about 2 to 3 minutes after arrival. The rest was log delay, which I can't control.

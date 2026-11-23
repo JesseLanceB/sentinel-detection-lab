@@ -1,0 +1,16 @@
+// Rule 3: Azure diagnostic setting deleted (MITRE ATT&CK T1562.008)
+// Data source: Azure Activity log, in the AzureActivity table.
+// Diagnostic settings are the pipes that send Azure logs to the SIEM. Deleting one
+// stops those logs from arriving, so attackers do it before their main action.
+// Rule type: near-real-time (NRT). One event is enough to alert, and NRT picks up
+// each event by arrival time, so the query needs no time filter.
+AzureActivity
+| where OperationNameValue =~ "MICROSOFT.INSIGHTS/DIAGNOSTICSETTINGS/DELETE"
+// Every action logs a Start row and an outcome row. Keep the outcomes only, so one
+// delete raises one alert. Failure is kept on purpose: a failed attempt to cut
+// logging can mean someone testing what a stolen account is allowed to do.
+| where ActivityStatusValue in ("Success", "Failure")
+// _ResourceId ends in .../diagnosticsettings/<name>: pull out the name of the deleted setting
+| extend SettingName = extract(@"(?i)diagnosticsettings/([^/]+)$", 1, _ResourceId)
+| project TimeGenerated, ActivityStatusValue, SettingName,
+    Caller, CallerIpAddress, ResourceGroup, _ResourceId
