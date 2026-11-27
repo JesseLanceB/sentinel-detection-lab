@@ -2,6 +2,30 @@
 
 Building and testing detections in Microsoft Sentinel, mapped to MITRE ATT&CK. Follow-on to my [Sysmon masquerading detection](https://github.com/JesseLanceB/sysmon-masquerading-detection) and [LLM chatbot security assessment](https://github.com/JesseLanceB/llm-chatbot-security).
 
+## Results and lessons
+
+Three detections are live in Microsoft Sentinel, and each was tested with a harmless simulation of the attack it targets. All three run as near-real-time (NRT) rules and raised exactly one alert per test event.
+
+| Rule | MITRE ATT&CK | Event to alert in testing |
+|---|---|---|
+| Renamed system binary executed | T1036.003 | 11 min 21 s: 8 min 29 s for the log to arrive, then 2 min 52 s for the rule |
+| Defender exclusion added | T1562.001 | 2 min 58 s: 36 s for the log, then 2 min 22 s for the rule |
+| Diagnostic setting deleted | T1562.008 | 5 min 59 s: 3 min 43 s for the log, then 2 min 16 s for the rule |
+
+**What I learned**
+
+1. **Check all three clocks before calling a miss.** Every alert depends on when the event happened, when its log arrived, and when the rule ran. My first live test looked like a miss, but the alerts were created minutes after I checked.
+2. **Late logs break scheduled rules in two ways.** A short lookback misses slow logs, and overlapping windows count fast ones twice. I traced a duplicate alert by rebuilding each rule run's query window from the `SecurityAlert` table, ruled out one explanation when its prediction failed, and moved the rules to NRT, which reads logs by arrival time.
+3. **Validate the telemetry before writing the rule.** Sysmon missed a Defender exclusion added inside an open PowerShell session. Defender's own Event 5007 caught both test methods, so Rule 2 uses that instead.
+4. **A detection can depend on the pipe it watches.** Rule 3 reads Azure Activity logs through the same diagnostic setting an attacker would delete. When I deleted that setting and restored it within minutes, everything still arrived. When it stayed down for 30 minutes, nothing from that window reached Sentinel, including the delete itself, while Azure's own Activity log kept every event. Rule 3 can't be the only defence for its own data source.
+5. **Verify the cost guardrails.** Deallocating the VM stopped compute charges, but its disk and public IP kept billing, and in November they cost more than the VM itself.
+
+**What I'd build next**
+
+- A scheduled rule that alerts when Azure Activity logs go quiet for longer than normal, to catch an attacker who cuts the pipe and waits.
+- A rule for diagnostic-setting edits (`WRITE`) by an account with no such changes in the past 30 days.
+- PowerShell Script Block Logging (Event 4104), to record commands typed inside a session.
+
 ## Goal
 
 Collect Windows and Azure logs in Microsoft Sentinel, simulate attacker techniques with harmless tests, and write KQL analytics rules that catch them. The first rule ports my Sysmon detection for renamed system binaries (T1036.003) into a cloud SIEM. The second catches an attacker switching off antivirus scanning for their files (T1562.001), and the third catches someone cutting the pipes that send Azure logs to the SIEM (T1562.008).
@@ -20,6 +44,7 @@ Collect Windows and Azure logs in Microsoft Sentinel, simulate attacker techniqu
 - **Daily cap of 1 GB/day** on the workspace (resets 02:00 UTC). Outside the trial, Analytics Logs ingestion is listed at $2.76/GB in this region, plus Sentinel charges, so the cap limits the worst-case daily cost. The trade-off: once the cap is hit, logs stop until the reset, which would be a blind spot in a production SOC. [Screenshot](screenshots/cost-guardrails.png)
 - **One resource group** (`rg-sentinel-lab`) holds every lab resource, in Canada Central (one of the subscription's allowed regions).
 - **VM at $0.0524/hour, deallocated after every session,** so compute isn't billed while idle. Auto-shutdown at 11:30 PM Eastern catches a forgotten session.
+- **Deallocating doesn't stop everything.** The VM's disk and its public IP keep billing while it's off. November's charges: public IP CA$2.15, disk CA$1.43, compute CA$0.62. For a longer-running lab, removing the public IP between sessions would cut the largest idle cost.
 - **RDP allowed from a single IP address only.** Internet-facing RDP is brute-forced within minutes of exposure.
 - **Credit checked weekly.**
 
@@ -66,7 +91,9 @@ Triage helper: [child processes of the flagged process](kql/triage-child-process
 - [x] Rule 2: Microsoft Defender exclusion added (T1562.001)
 - [x] Duplicate alerts investigated; both rules moved to near-real-time (NRT)
 - [x] Rule 3: diagnostic setting deleted (T1562.008)
-- [ ] Writeup and lessons learned
+- [x] Pipe experiment and gap test: what happens when the subscription log export is deleted
+- [x] Writeup and lessons learned
+- [ ] Demo video, then teardown
 
 ## Lab notes
 
@@ -136,3 +163,20 @@ Triage helper: [child processes of the flagged process](kql/triage-child-process
 - **Rule.** High severity: legitimate deletions are rare and should go through change management, and cutting logs usually comes right before an attacker's main action. Account, IP and Azure resource entities mapped. [Rule](screenshots/rule3-nrt-rule.png)
 - **Live test.** I created and deleted `diag-test-delete2`. The delete happened at 8:08:25 PM and arrived 3 minutes 43 seconds later. The NRT rule raised one alert 2 minutes 16 seconds after arrival, about 6 minutes after the delete. The create raised nothing. [Arrival](screenshots/rule3-nrt-event-arrival.png) · [Alert](screenshots/rule3-nrt-one-alert.png)
 - **Time to alert = log delay + rule delay.** Across all three rules, NRT added about 2 to 3 minutes after arrival. The rest was log delay, which I can't control.
+
+**November 24: deleting the pipe Rule 3 depends on.** Rule 3 reads `AzureActivity`, which arrives through the `activity-to-sentinel` diagnostic setting, the same setting an attacker would delete first. I predicted that deleting it would stop its own delete event, and anything after it, from reaching Sentinel.
+
+- I deleted the setting, added a tag to the resource group while it was down, and recreated it, with an accidental extra delete and recreate in between. Everything arrived, 3.6 to 7.8 minutes after it happened, including the tag added while the pipe was down. [Events](screenshots/rule3-pipe-experiment-events.png)
+- Rule 3 raised one alert for each of the two deletes. Both deletes arrived in the same minute, and both alerts were created in the same second: one NRT run picked up both. [Alerts](screenshots/rule3-pipe-experiment-alerts.png)
+- **My predictions were wrong.** The most likely reason is that a deleted diagnostic setting doesn't stop exporting instantly, and the pipe was down for only about 2 minutes at a time. Microsoft doesn't document how quickly a delete takes effect, so this is an inference. The test was too short to show a real gap, so I ran a longer one.
+
+**November 26: a 30-minute gap.** I deleted `activity-to-sentinel` at 9:32 PM, added a tag to the resource group at 9:48 PM, and recreated the setting at 10:03 PM.
+
+- **Nothing from the gap reached Sentinel:** not the delete, not the tag, and Rule 3 raised no alert. Azure's own Activity log, which doesn't depend on the export, recorded all three. [Empty result](screenshots/gap-test-nothing-arrived.png)
+- **The recreated setting didn't resume.** A test event sent 25 minutes after the recreate was still missing 18 hours later. The workspace was healthy (`_LogOperation` showed no ingestion problems), and the Sentinel connector still said "Connected", but its last log was two days old. "Connected" only means the setting exists; the last-received time shows whether data is flowing. [Connector](screenshots/connector-connected-but-silent.png)
+- **Evidence before changes.** I didn't delete and recreate again straight away, so that a fix couldn't hide whether the setting just needed more time.
+
+**November 27: the fix.** I deleted the broken setting and created a new one under a different name, `activity-to-sentinel-v2`, in case Azure kept stale state for the old name. A test tag arrived 5.5 minutes later. So did the delete of the old setting, which happened 33 seconds before the new one existed, and Rule 3 raised one alert 2 minutes 24 seconds after it arrived. [Events](screenshots/pipe-v2-fixed.png) · [Alert](screenshots/pipe-v2-rule3-alert.png)
+
+- **What the three tests suggest together:** the export picks up events a few minutes after they happen and sends them through whatever setting exists at that moment. Restored within 2 minutes (November 24) or 33 seconds (November 27), nothing was lost. Gone for 30 minutes (November 26), everything in that window was. Microsoft doesn't document this, so it's an inference from three tests. Why the same-name recreate never resumed is still unexplained.
+- **The security finding:** Rule 3 reliably catches deletions of other diagnostic settings, but if an attacker deletes the subscription export and doesn't restore it, the delete itself can be lost. The defence needs a second layer: a scheduled rule that alerts when `AzureActivity` goes quiet, and investigators who check the source Activity log when the SIEM falls silent.
